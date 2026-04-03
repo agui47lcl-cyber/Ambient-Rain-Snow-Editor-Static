@@ -1,0 +1,1439 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ambient Rain & Snow Editor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@19",
+        "react-dom": "https://esm.sh/react-dom@19",
+        "react-dom/client": "https://esm.sh/react-dom@19/client",
+        "motion/react": "https://esm.sh/motion@12/react",
+        "lucide-react": "https://esm.sh/lucide-react",
+        "clsx": "https://esm.sh/clsx",
+        "tailwind-merge": "https://esm.sh/tailwind-merge"
+      }
+    }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@400;700&family=JetBrains+Mono:wght@400;500&family=Ma+Shan+Zheng&family=Noto+Serif+SC:wght@400;700&display=swap');
+
+        body {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            color: white;
+            overflow: hidden;
+        }
+
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+
+        input[type="range"] {
+            -webkit-appearance: none;
+            background: transparent;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 12px;
+            width: 12px;
+            border-radius: 50%;
+            background: white;
+            cursor: pointer;
+            margin-top: -4px;
+        }
+        input[type="range"]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 4px;
+            cursor: pointer;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="module">
+        import React, { useState, useRef, useEffect, useCallback, memo, useLayoutEffect, createElement, useMemo } from 'https://esm.sh/react@19';
+        import { createRoot } from 'https://esm.sh/react-dom@19/client';
+        import { motion, AnimatePresence } from 'https://esm.sh/motion@12/react';
+        import { 
+          Settings, Upload, Save, Trash2, X, Maximize2, Minimize2, Type, Sliders, 
+          ChevronDown, Volume2, VolumeX, ChevronLeft, ChevronRight, Plus, 
+          GripHorizontal, Pencil, Zap, CloudRain, CloudSnow, Music, History, Clock
+        } from 'https://esm.sh/lucide-react';
+        import { clsx } from 'https://esm.sh/clsx';
+        import { twMerge } from 'https://esm.sh/tailwind-merge';
+
+        function cn(...inputs) {
+          return twMerge(clsx(inputs));
+        }
+
+        // --- Audio Engine ---
+        class AudioEngine {
+          constructor(rainUrl, snowUrl) {
+            this.rainUrl = rainUrl;
+            this.snowUrl = snowUrl;
+            this.context = null;
+            this.rainAudio = null;
+            this.snowAudio = null;
+            this.rainGain = null;
+            this.snowGain = null;
+            this.bgmAudio = null;
+            this.bgmGain = null;
+            this.masterGain = null;
+            this.initialized = false;
+            this.currentMode = 'rain';
+            this.targetVolume = 0.5;
+            this.bgmVolume = 0.5;
+            this.isMuted = false;
+            this.isBgmEnabled = false;
+            this.playPromise = null;
+          }
+
+          async init() {
+            if (this.initialized) return;
+            try {
+              this.context = new (window.AudioContext || window.webkitAudioContext)();
+              const createAudio = (url) => {
+                const audio = new Audio(url);
+                audio.loop = true;
+                audio.preload = "auto";
+                audio.addEventListener('error', (e) => {
+                  console.error("Audio error detected:", audio.error?.message || "Unknown error", e);
+                  setTimeout(() => {
+                    if (audio.src && audio.src !== window.location.href) {
+                      audio.load();
+                      if (this.initialized && !this.isMuted) audio.play().catch(() => {});
+                    }
+                  }, 5000);
+                });
+                audio.addEventListener('stalled', () => {
+                  audio.load();
+                  audio.play().catch(() => {});
+                });
+                return audio;
+              };
+              this.rainAudio = createAudio(this.rainUrl);
+              this.snowAudio = createAudio(this.snowUrl);
+              this.bgmAudio = createAudio();
+              const rainSource = this.context.createMediaElementSource(this.rainAudio);
+              const snowSource = this.context.createMediaElementSource(this.snowAudio);
+              const bgmSource = this.context.createMediaElementSource(this.bgmAudio);
+              this.rainGain = this.context.createGain();
+              this.snowGain = this.context.createGain();
+              this.bgmGain = this.context.createGain();
+              this.masterGain = this.context.createGain();
+              rainSource.connect(this.rainGain);
+              snowSource.connect(this.snowGain);
+              bgmSource.connect(this.bgmGain);
+              this.rainGain.connect(this.masterGain);
+              this.snowGain.connect(this.masterGain);
+              this.bgmGain.connect(this.masterGain);
+              this.masterGain.connect(this.context.destination);
+              this.updateVolumes(0);
+              this.initialized = true;
+            } catch (error) {
+              console.error("Failed to initialize AudioEngine:", error);
+            }
+          }
+
+          async play() {
+            if (!this.initialized) await this.init();
+            if (!this.context) return;
+            if (this.context.state === 'suspended') await this.context.resume();
+            const playAudio = async (audio) => {
+              if (!audio || !audio.src || audio.src === window.location.href) return;
+              try {
+                if (!audio.paused) return;
+                if (audio.readyState < 3) {
+                  await new Promise((resolve) => {
+                    const onCanPlay = () => { audio.removeEventListener('canplay', onCanPlay); resolve(); };
+                    const onError = () => { audio.removeEventListener('error', onError); resolve(); };
+                    audio.addEventListener('canplay', onCanPlay);
+                    audio.addEventListener('error', onError);
+                    setTimeout(resolve, 5000);
+                  });
+                }
+                if (audio.paused && audio.src && audio.src !== window.location.href) await audio.play();
+              } catch (error) { if (error.name !== 'AbortError') console.warn("Playback failed:", error); }
+            };
+            if (this.playPromise) await this.playPromise;
+            this.playPromise = (async () => {
+              try {
+                const playPromises = [playAudio(this.rainAudio), playAudio(this.snowAudio)];
+                if (this.isBgmEnabled && this.bgmAudio?.src && this.bgmAudio.src !== window.location.href) playPromises.push(playAudio(this.bgmAudio));
+                await Promise.all(playPromises);
+              } finally { this.playPromise = null; }
+            })();
+            await this.playPromise;
+          }
+
+          pause() {
+            this.rainAudio?.pause();
+            this.snowAudio?.pause();
+            this.bgmAudio?.pause();
+          }
+
+          setBgmUrl(url) {
+            if (!this.bgmAudio || !url) return;
+            const absoluteUrl = new URL(url, window.location.href).href;
+            if (this.bgmAudio.src === absoluteUrl) return;
+            this.bgmAudio.pause();
+            this.bgmAudio.src = absoluteUrl;
+            if (this.isBgmEnabled && this.initialized) {
+              const onCanPlay = () => {
+                this.bgmAudio?.removeEventListener('canplay', onCanPlay);
+                this.bgmAudio?.play().catch(() => {});
+              };
+              this.bgmAudio.addEventListener('canplay', onCanPlay);
+              this.bgmAudio.load();
+            }
+          }
+
+          setBgmEnabled(enabled) {
+            this.isBgmEnabled = enabled;
+            if (enabled && this.initialized && this.bgmAudio?.src) this.bgmAudio.play().catch(() => {});
+            else if (!enabled) this.bgmAudio?.pause();
+            this.updateVolumes(0.1);
+          }
+
+          setVolume(volume) { this.targetVolume = volume; this.updateVolumes(0.1); }
+          setBgmVolume(volume) { this.bgmVolume = volume; this.updateVolumes(0.1); }
+          setMuted(muted) { this.isMuted = muted; this.updateVolumes(0.1); }
+          setMode(mode) {
+            if (this.currentMode === mode) return;
+            this.currentMode = mode;
+            this.updateVolumes(0.5);
+          }
+
+          updateVolumes(fadeTime) {
+            if (!this.context || !this.rainGain || !this.snowGain || !this.bgmGain || !this.masterGain) return;
+            const now = this.context.currentTime;
+            const masterVol = this.isMuted ? 0 : this.targetVolume;
+            this.masterGain.gain.linearRampToValueAtTime(masterVol, now + fadeTime);
+            const rainTarget = this.currentMode === 'rain' ? 1 : 0;
+            const snowTarget = this.currentMode === 'snow' ? 1 : 0;
+            this.rainGain.gain.linearRampToValueAtTime(rainTarget, now + fadeTime);
+            this.snowGain.gain.linearRampToValueAtTime(snowTarget, now + fadeTime);
+            const bgmTarget = this.isBgmEnabled ? this.bgmVolume : 0;
+            this.bgmGain.gain.linearRampToValueAtTime(bgmTarget, now + fadeTime);
+          }
+
+          getIsPlaying() {
+            const ambientPlaying = !!(this.rainAudio && !this.rainAudio.paused) || !!(this.snowAudio && !this.snowAudio.paused);
+            const bgmPlaying = !!(this.bgmAudio && !this.bgmAudio.paused);
+            return ambientPlaying || bgmPlaying;
+          }
+        }
+
+        // --- Rain Shader ---
+        const RainShader = ({
+          mode,
+          raininess,
+          fog,
+          refraction,
+          speed,
+          size,
+          bgRotation,
+          bgScale,
+          bgContrast,
+          bgBrightness,
+          backgroundType,
+          backgroundUrl,
+        }) => {
+          const canvasRef = useRef(null);
+          const videoRef = useRef(null);
+          const textureRef = useRef(null);
+          const programRef = useRef(null);
+          const glRef = useRef(null);
+          const uniformsRef = useRef({});
+
+          const propsRef = useRef({
+            mode, raininess, fog, refraction, speed, size, bgRotation, bgScale, bgContrast, bgBrightness, backgroundType, backgroundUrl
+          });
+
+          useEffect(() => {
+            propsRef.current = {
+              mode, raininess, fog, refraction, speed, size, bgRotation, bgScale, bgContrast, bgBrightness, backgroundType, backgroundUrl
+            };
+          }, [mode, raininess, fog, refraction, speed, size, bgRotation, bgScale, bgContrast, bgBrightness, backgroundType, backgroundUrl]);
+
+          useEffect(() => {
+            if (backgroundType === 'video' && backgroundUrl) {
+              const video = document.createElement('video');
+              video.src = backgroundUrl;
+              video.loop = true;
+              video.muted = true;
+              video.play();
+              videoRef.current = video;
+            } else {
+              videoRef.current = null;
+            }
+          }, [backgroundType, backgroundUrl]);
+
+          useEffect(() => {
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+
+            const gl = canvas.getContext('webgl', { antialias: false, depth: false, stencil: false });
+            if (!gl) return;
+            glRef.current = gl;
+
+            const vertexShaderSource = `
+              attribute vec2 position;
+              void main() {
+                gl_Position = vec4(position, 0.0, 1.0);
+              }
+            `;
+
+            const fragmentShaderSource = `
+              precision highp float;
+              uniform vec3 iResolution;
+              uniform float iTime;
+              uniform vec4 iMouse;
+              uniform sampler2D iChannel0;
+              uniform int iBgType;
+              uniform int iMode;
+              
+              uniform float iRaininess;
+              uniform float iFog;
+              uniform float iRefraction;
+              uniform float iSpeed;
+              uniform float iSize;
+              uniform float iBgRotation;
+              uniform float iBgScale;
+              uniform float iBgContrast;
+              uniform float iBgBrightness;
+
+              #define S(a, b, t) smoothstep(a, b, t)
+              #define USE_POST_PROCESSING
+              #define SNOWRATE 200.0
+              #define PI 3.14159
+              #define HALFPI 1.570796
+
+              vec2 mod289(vec2 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+              vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+              vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+              vec3 permute(vec3 x) { return mod289(((x*34.0)+1.0)*x); }
+              vec4 permute(vec4 x) { return mod((34.0 * x + 1.0) * x, 289.0); }
+              vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+
+              float snoise(vec2 v) {
+                const vec4 C = vec4(0.211324865405187,0.366025403784439,-0.577350269189626,0.024390243902439);
+                vec2 i  = floor(v + dot(v, C.yy) );
+                vec2 x0 = v -   i + dot(i, C.xx);
+                vec2 i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+                vec4 x12 = x0.xyxy + C.xxzz;
+                x12.xy -= i1;
+                i = mod289(i);
+                vec3 p = permute( permute( i.y + vec3(0.0, i1.y, 1.0 )) + i.x + vec3(0.0, i1.x, 1.0 ));
+                vec3 m = max(0.5 - vec3(dot(x0,x0), dot(x12.xy,x12.xy), dot(x12.zw,x12.zw)), 0.0);
+                m = m*m; m = m*m;
+                vec3 x = 2.0 * fract(p * C.www) - 1.0;
+                vec3 h = abs(x) - 0.5;
+                vec3 ox = floor(x + 0.5);
+                vec3 a0 = x - ox;
+                m *= 1.79284291400159 - 0.85373472095314 * ( a0*a0 + h*h );
+                vec3 g;
+                g.x  = a0.x  * x0.x  + h.x  * x0.y;
+                g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+                return 130.0 * dot(m, g);		
+              }
+
+              float cellular2x2(vec2 P) {
+                #define K 0.142857142857
+                #define K2 0.0714285714285
+                #define jitter 0.8
+                vec2 Pi = mod(floor(P), 289.0);
+                vec2 Pf = fract(P);
+                vec4 Pfx = Pf.x + vec4(-0.5, -1.5, -0.5, -1.5);
+                vec4 Pfy = Pf.y + vec4(-0.5, -0.5, -1.5, -1.5);
+                vec4 p = permute(Pi.x + vec4(0.0, 1.0, 0.0, 1.0));
+                p = permute(p + Pi.y + vec4(0.0, 0.0, 1.0, 1.0));
+                vec4 ox = mod(p, 7.0)*K+K2;
+                vec4 oy = mod(floor(p*K),7.0)*K+K2;
+                vec4 dx = Pfx + jitter*ox;
+                vec4 dy = Pfy + jitter*oy;
+                vec4 d = dx * dx + dy * dy;
+                d.xy = min(d.xy, d.zw);
+                d.x = min(d.x, d.y);
+                return d.x;
+              }
+
+              float fbm(vec2 p) {
+                float f = 0.0; float w = 0.5;
+                for (int i = 0; i < 5; i ++) {
+                  f += w * snoise(p);
+                  p *= 2.; w *= 0.5;
+                }
+                return f;
+              }
+
+              vec3 N13(float p) {
+                 vec3 p3 = fract(vec3(p) * vec3(.1031,.11369,.13787));
+                 p3 += dot(p3, p3.yzx + 19.19);
+                 return fract(vec3((p3.x + p3.y)*p3.z, (p3.x+p3.z)*p3.y, (p3.y+p3.z)*p3.x));
+              }
+
+              vec4 N14(float t) { return fract(sin(t*vec4(123., 1024., 1456., 264.))*vec4(6547., 345., 8799., 1564.)); }
+              float N(float t) { return fract(sin(t*12345.564)*7658.76); }
+              float Saw(float b, float t) { return S(0., b, t)*S(1., b, t); }
+
+              vec2 DropLayer2(vec2 uv, float t, float iSize) {
+                  vec2 UV = uv;
+                  uv.y += t*0.75;
+                  vec2 a = vec2(6., 1.);
+                  vec2 grid = a*2.;
+                  vec2 id = floor(uv*grid);
+                  float colShift = N(id.x); 
+                  uv.y += colShift;
+                  id = floor(uv*grid);
+                  vec3 n = N13(id.x*35.2+id.y*2376.1);
+                  vec2 st = fract(uv*grid)-vec2(.5, 0);
+                  float x = n.x-.5;
+                  float y = UV.y*20. * iSize;
+                  float wiggle = sin(y+sin(y));
+                  x += wiggle*(.5-abs(x))*(n.z-.5);
+                  x *= .7;
+                  float ti = fract(t+n.z);
+                  y = (Saw(.85, ti)-.5)*.9+.5;
+                  vec2 p = vec2(x, y);
+                  float d = length((st-p)*a.yx);
+                  float mainDrop = S(.4, .0, d);
+                  float r = sqrt(S(1., y, st.y));
+                  float cd = abs(st.x-x);
+                  float trail = S(.23*r, .15*r*r, cd);
+                  float trailFront = S(-.02, .02, st.y-y);
+                  trail *= trailFront*r*r;
+                  y = UV.y;
+                  float trail2 = S(.2*r, .0, cd);
+                  float droplets = max(0., (sin(y*(1.-y)*120.)-st.y))*trail2*trailFront*n.z;
+                  y = fract(y*10.)+(st.y-.5);
+                  float dd = length(st-vec2(x, y));
+                  droplets = S(.3, 0., dd);
+                  return vec2(mainDrop+droplets*r*trailFront, trail);
+              }
+
+              float StaticDrops(vec2 uv, float t) {
+                uv *= 40.;
+                vec2 id = floor(uv);
+                uv = fract(uv)-.5;
+                vec3 n = N13(id.x*107.45+id.y*3543.654);
+                vec2 p = (n.xy-.5)*.7;
+                float d = length(uv-p);
+                float fade = Saw(.025, fract(t+n.z));
+                return S(.3, 0., d)*fract(n.z*10.)*fade;
+              }
+
+              vec2 Drops(vec2 uv, float t, float l0, float l1, float l2, float iSize) {
+                  float s = StaticDrops(uv, t)*l0; 
+                  vec2 m1 = DropLayer2(uv, t, iSize)*l1;
+                  vec2 m2 = DropLayer2(uv*1.85, t, iSize)*l2;
+                  float c = s+m1.x+m2.x;
+                  c = S(.3, 1., c);
+                  return vec2(c, max(m1.y*l0, m2.y*l1));
+              }
+
+              vec2 Rotate(vec2 v, float a) {
+                float s = sin(a); float c = cos(a);
+                return vec2(v.x * c - v.y * s, v.x * s + v.y * c);
+              }
+
+              void main() {
+                vec2 fragCoord = gl_FragCoord.xy;
+                vec2 uv = (fragCoord.xy-.5*iResolution.xy) / iResolution.y;
+                vec2 UV = fragCoord.xy/iResolution.xy;
+                float T = iTime;
+                vec3 col;
+                if (iMode == 0) {
+                  float rainAmount = iRaininess;
+                  float t = T * 0.2 * iSpeed;
+                  float maxBlur = mix(3., 6., rainAmount) * iFog * 2.0;
+                  float minBlur = 2. * iFog;
+                  vec2 dropsUv = (UV-.5)*(.9+1.0*.1)+.5;
+                  float staticDrops = S(-.5, 1., rainAmount)*2.;
+                  float layer1 = S(.25, .75, rainAmount);
+                  float layer2 = S(.0, .5, rainAmount);
+                  vec2 c = Drops(uv, t, staticDrops, layer1, layer2, iSize);
+                  vec2 e = vec2(.001, 0.);
+                  float cx = Drops(uv+e, t, staticDrops, layer1, layer2, iSize).x;
+                  float cy = Drops(uv+e.yx, t, staticDrops, layer1, layer2, iSize).x;
+                  vec2 n = vec2(cx-c.x, cy-c.x);
+                  vec2 bgUv = UV + n * iRefraction;
+                  bgUv = (bgUv - 0.5) / max(iBgScale, 0.001) + 0.5;
+                  bgUv = Rotate(bgUv - 0.5, iBgRotation * 3.14159 / 180.0) + 0.5;
+                  if (iBgType == 0) {
+                    col = mix(vec3(0.05, 0.1, 0.2), vec3(0.3, 0.1, 0.4), bgUv.y + sin(iTime * 0.2) * 0.3);
+                    col += sin(bgUv.x * 8. + iTime * 0.5) * 0.05;
+                  } else { col = texture2D(iChannel0, bgUv).rgb; }
+                  col = (col - 0.5) * iBgContrast + 0.5;
+                  col *= iBgBrightness;
+                } else {
+                  // New Snow Shader Logic
+                  #define SNOW_LAYERS 50
+                  #define SNOW_DEPTH .5
+                  #define SNOW_WIDTH .3
+                  #define SNOW_SPEED (.6 * iSpeed)
+                  
+                  const mat3 p = mat3(13.323122,23.5112,21.71123,21.1212,28.7312,11.9312,21.8112,14.7212,61.3934);
+                  vec2 uv_snow = iMouse.xy/iResolution.xy + vec2(1.,iResolution.y/iResolution.x)*fragCoord.xy / iResolution.xy;
+                  vec3 acc = vec3(0.0);
+                  float dof = 5.*sin(iTime*.1);
+                  for (int i=0;i<SNOW_LAYERS;i++) {
+                    float fi = float(i);
+                    vec2 q = uv_snow*(1.+fi*SNOW_DEPTH);
+                    q += vec2(q.y*(SNOW_WIDTH*mod(fi*7.238917,1.)-SNOW_WIDTH*.5),SNOW_SPEED*iTime/(1.+fi*SNOW_DEPTH*.03));
+                    vec3 n = vec3(floor(q),31.189+fi);
+                    vec3 m = floor(n)*.00001 + fract(n);
+                    vec3 mp = (31415.9+m)/fract(p*m);
+                    vec3 r = fract(mp);
+                    vec2 s = abs(mod(q,1.)-.5+.9*r.xy-.45);
+                    s += .01*abs(2.*fract(10.*q.yx)-1.); 
+                    float d = .6*max(s.x-s.y,s.x+s.y)+max(s.x,s.y)-.01;
+                    float edge = .005+.05*min(.5*abs(fi-5.-dof),1.);
+                    acc += vec3(smoothstep(edge,-edge,d)*(r.x/(1.+.02*fi*SNOW_DEPTH)));
+                  }
+                  float flakes = acc.r * iRaininess * 2.0;
+                  
+                  if (iBgType == 0) {
+                    vec2 bgUv = UV;
+                    bgUv = (bgUv - 0.5) / max(iBgScale, 0.001) + 0.5;
+                    bgUv = Rotate(bgUv - 0.5, iBgRotation * 3.14159 / 180.0) + 0.5;
+                    col = mix(vec3(0.05, 0.1, 0.2), vec3(0.3, 0.1, 0.4), bgUv.y + sin(iTime * 0.2) * 0.3);
+                    col += sin(bgUv.x * 8. + iTime * 0.5) * 0.05;
+                    col += vec3(flakes * 0.9, flakes, flakes * 1.1);
+                  } else {
+                    vec2 bgUv = UV;
+                    bgUv = (bgUv - 0.5) / max(iBgScale, 0.001) + 0.5;
+                    bgUv = Rotate(bgUv - 0.5, iBgRotation * 3.14159 / 180.0) + 0.5;
+                    vec3 background = texture2D(iChannel0, bgUv).rgb;
+                    background = (background - 0.5) * iBgContrast + 0.5;
+                    background *= iBgBrightness;
+                    col = background + vec3(flakes * 0.9, flakes, flakes * 1.1);
+                  }
+                }
+                #ifdef USE_POST_PROCESSING
+                float t_post = (T+3.)*.5;
+                float colFade = sin(t_post*.2)*.5+.5;
+                col *= mix(vec3(1.), vec3(.8, .9, 1.3), colFade);
+                col *= 1.-dot(UV-0.5, UV-0.5);
+                col *= S(0., 10., T);
+                #endif
+                gl_FragColor = vec4(col, 1.);
+              }
+            `;
+
+            const createShader = (type, source) => {
+              const shader = gl.createShader(type);
+              gl.shaderSource(shader, source);
+              gl.compileShader(shader);
+              if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error(gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+              }
+              return shader;
+            };
+
+            const vs = createShader(gl.VERTEX_SHADER, vertexShaderSource);
+            const fs = createShader(gl.FRAGMENT_SHADER, fragmentShaderSource);
+            const program = gl.createProgram();
+            if (!program || !vs || !fs) return;
+            gl.attachShader(program, vs);
+            gl.attachShader(program, fs);
+            gl.linkProgram(program);
+            gl.useProgram(program);
+            programRef.current = program;
+
+            const positionBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+
+            const positionLocation = gl.getAttribLocation(program, 'position');
+            gl.enableVertexAttribArray(positionLocation);
+            gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+
+            uniformsRef.current = {
+              iResolution: gl.getUniformLocation(program, 'iResolution'),
+              iTime: gl.getUniformLocation(program, 'iTime'),
+              iRaininess: gl.getUniformLocation(program, 'iRaininess'),
+              iFog: gl.getUniformLocation(program, 'iFog'),
+              iRefraction: gl.getUniformLocation(program, 'iRefraction'),
+              iSpeed: gl.getUniformLocation(program, 'iSpeed'),
+              iSize: gl.getUniformLocation(program, 'iSize'),
+              iBgRotation: gl.getUniformLocation(program, 'iBgRotation'),
+              iBgScale: gl.getUniformLocation(program, 'iBgScale'),
+              iBgContrast: gl.getUniformLocation(program, 'iBgContrast'),
+              iBgBrightness: gl.getUniformLocation(program, 'iBgBrightness'),
+              iBgType: gl.getUniformLocation(program, 'iBgType'),
+              iMode: gl.getUniformLocation(program, 'iMode'),
+            };
+
+            textureRef.current = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, textureRef.current);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+            let animationFrameId;
+            const render = (time) => {
+              if (!glRef.current || !programRef.current) return;
+              const gl = glRef.current;
+              const uniforms = uniformsRef.current;
+              const p = propsRef.current;
+              const width = canvas.clientWidth;
+              const height = canvas.clientHeight;
+              if (canvas.width !== width || canvas.height !== height) {
+                canvas.width = width; canvas.height = height;
+                gl.viewport(0, 0, width, height);
+              }
+              gl.uniform3f(uniforms.iResolution, width, height, 1.0);
+              gl.uniform1f(uniforms.iTime, time * 0.001);
+              gl.uniform1f(uniforms.iRaininess, p.raininess);
+              gl.uniform1f(uniforms.iFog, p.fog);
+              gl.uniform1f(uniforms.iRefraction, p.refraction);
+              gl.uniform1f(uniforms.iSpeed, p.speed);
+              gl.uniform1f(uniforms.iSize, p.size);
+              gl.uniform1f(uniforms.iBgRotation, p.bgRotation);
+              gl.uniform1f(uniforms.iBgScale, p.bgScale);
+              gl.uniform1f(uniforms.iBgContrast, p.bgContrast);
+              gl.uniform1f(uniforms.iBgBrightness, p.bgBrightness);
+              gl.uniform1i(uniforms.iBgType, p.backgroundType === 'fluid' ? 0 : 1);
+              gl.uniform1i(uniforms.iMode, p.mode === 'rain' ? 0 : 1);
+              if (p.backgroundType !== 'fluid' && p.backgroundUrl) {
+                if (p.backgroundType === 'video' && videoRef.current && videoRef.current.readyState >= 2) {
+                  gl.bindTexture(gl.TEXTURE_2D, textureRef.current);
+                  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, videoRef.current);
+                }
+              }
+              gl.drawArrays(gl.TRIANGLES, 0, 6);
+              animationFrameId = requestAnimationFrame(render);
+            };
+
+            if (backgroundType === 'image' && backgroundUrl) {
+              const img = new Image();
+              img.src = backgroundUrl;
+              img.onload = () => {
+                if (glRef.current && textureRef.current) {
+                  glRef.current.bindTexture(glRef.current.TEXTURE_2D, textureRef.current);
+                  glRef.current.texImage2D(glRef.current.TEXTURE_2D, 0, glRef.current.RGBA, glRef.current.RGBA, glRef.current.UNSIGNED_BYTE, img);
+                }
+              };
+            }
+            animationFrameId = requestAnimationFrame(render);
+            return () => cancelAnimationFrame(animationFrameId);
+          }, []);
+
+          useEffect(() => {
+            if (backgroundType === 'image' && backgroundUrl) {
+              const img = new Image();
+              img.src = backgroundUrl;
+              img.onload = () => {
+                if (glRef.current && textureRef.current) {
+                  glRef.current.bindTexture(glRef.current.TEXTURE_2D, textureRef.current);
+                  glRef.current.texImage2D(glRef.current.TEXTURE_2D, 0, glRef.current.RGBA, glRef.current.RGBA, glRef.current.UNSIGNED_BYTE, img);
+                }
+              };
+            }
+          }, [backgroundType, backgroundUrl]);
+
+          return createElement('canvas', { ref: canvasRef, className: "fixed inset-0 w-full h-full -z-10" });
+        };
+        // --- Vaporize Text Effect ---
+        const Tag = {
+          H1: "h1",
+          H2: "h2",
+          H3: "h3",
+          P: "p",
+        };
+
+        const calculateVaporizeSpread = (fontSize) => {
+          const size = typeof fontSize === "string" ? parseInt(fontSize) : fontSize;
+          const points = [
+            { size: 20, spread: 0.2 },
+            { size: 50, spread: 0.5 },
+            { size: 100, spread: 1.5 }
+          ];
+          if (size <= points[0].size) return points[0].spread;
+          if (size >= points[points.length - 1].size) return points[points.length - 1].spread;
+          let i = 0;
+          while (i < points.length - 1 && points[i + 1].size < size) i++;
+          const p1 = points[i];
+          const p2 = points[i + 1];
+          return p1.spread + (size - p1.size) * (p2.spread - p1.spread) / (p2.size - p1.size);
+        };
+
+        const parseColor = (color) => {
+          const rgbMatch = color.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+          const rgbaMatch = color.match(/rgba\((\d+),\s*(\d+),\s*(\d+),\s*([\d.]+)\)/);
+          if (rgbaMatch) {
+            const [_, r, g, b, a] = rgbaMatch;
+            return `rgba(${r}, ${g}, ${b}, ${a})`;
+          } else if (rgbMatch) {
+            const [_, r, g, b] = rgbMatch;
+            return `rgba(${r}, ${g}, ${b}, 1)`;
+          }
+          return "rgba(0, 0, 0, 1)";
+        };
+
+        function transformValue(input, inputRange, outputRange, clamp = false) {
+          const [inputMin, inputMax] = inputRange;
+          const [outputMin, outputMax] = outputRange;
+          const progress = (input - inputMin) / (inputMax - inputMin);
+          let result = outputMin + progress * (outputMax - outputMin);
+          if (clamp) {
+            if (outputMax > outputMin) result = Math.min(Math.max(result, outputMin), outputMax);
+            else result = Math.min(Math.max(result, outputMax), outputMin);
+          }
+          return result;
+        }
+
+        function useIsInView(ref) {
+          const [isInView, setIsInView] = useState(false);
+          useEffect(() => {
+            if (!ref.current) return;
+            const observer = new IntersectionObserver(([entry]) => { setIsInView(entry.isIntersecting); }, { threshold: 0, rootMargin: '50px' });
+            observer.observe(ref.current);
+            return () => observer.disconnect();
+          }, [ref]);
+          return isInView;
+        }
+
+        const createParticles = (ctx, canvas, text, textX, textY, font, color, alignment, verticalAlignment = "center", lineHeight = 1.2, fontSize = 50) => {
+          const particles = [];
+          const lines = text.split('\n');
+          const totalHeight = lines.length * fontSize * lineHeight;
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = color;
+          ctx.font = font;
+          ctx.textAlign = alignment;
+          ctx.textBaseline = "top";
+          let startY = verticalAlignment === "top" ? textY : verticalAlignment === "bottom" ? textY - totalHeight : textY - totalHeight / 2;
+          let maxTextWidth = 0;
+          let minTextLeft = Infinity;
+          lines.forEach((line, index) => {
+            const y = startY + index * fontSize * lineHeight;
+            ctx.fillText(line, textX, y);
+            const metrics = ctx.measureText(line);
+            const textWidth = metrics.width;
+            maxTextWidth = Math.max(maxTextWidth, textWidth);
+            let lineLeft = alignment === "center" ? textX - textWidth / 2 : alignment === "left" ? textX : textX - textWidth;
+            minTextLeft = Math.min(minTextLeft, lineLeft);
+          });
+          const textBoundaries = { left: minTextLeft, right: minTextLeft + maxTextWidth, width: maxTextWidth };
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const data = imageData.data;
+          const currentDPR = canvas.width / parseInt(canvas.style.width);
+          const sampleRate = Math.max(1, Math.round(currentDPR / 3));
+          for (let y = 0; y < canvas.height; y += sampleRate) {
+            for (let x = 0; x < canvas.width; x += sampleRate) {
+              const index = (y * canvas.width + x) * 4;
+              const alpha = data[index + 3];
+              if (alpha > 0) {
+                const originalAlpha = alpha / 255 * (sampleRate / currentDPR);
+                particles.push({ x, y, originalX: x, originalY: y, color: `rgba(${data[index]}, ${data[index + 1]}, ${data[index + 2]}, ${originalAlpha})`, opacity: originalAlpha, originalAlpha, velocityX: 0, velocityY: 0, angle: 0, speed: 0 });
+              }
+            }
+          }
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          return { particles, textBoundaries };
+        };
+
+        const updateParticles = (particles, vaporizeX, deltaTime, MULTIPLIED_VAPORIZE_SPREAD, VAPORIZE_DURATION, direction, density) => {
+          let allParticlesVaporized = true;
+          particles.forEach(particle => {
+            const shouldVaporize = direction === "left-to-right" ? particle.originalX <= vaporizeX : particle.originalX >= vaporizeX;
+            if (shouldVaporize) {
+              if (particle.speed === 0) {
+                particle.angle = Math.random() * Math.PI * 2;
+                particle.speed = (Math.random() * 1 + 0.5) * MULTIPLIED_VAPORIZE_SPREAD;
+                particle.velocityX = Math.cos(particle.angle) * particle.speed;
+                particle.velocityY = Math.sin(particle.angle) * particle.speed;
+                particle.shouldFadeQuickly = Math.random() > density;
+              }
+              if (particle.shouldFadeQuickly) {
+                particle.opacity = Math.max(0, particle.opacity - deltaTime);
+              } else {
+                const dx = particle.originalX - particle.x;
+                const dy = particle.originalY - particle.y;
+                const distanceFromOrigin = Math.sqrt(dx * dx + dy * dy);
+                const dampingFactor = Math.max(0.95, 1 - distanceFromOrigin / (100 * MULTIPLIED_VAPORIZE_SPREAD));
+                const randomSpread = MULTIPLIED_VAPORIZE_SPREAD * 3;
+                particle.velocityX = (particle.velocityX + (Math.random() - 0.5) * randomSpread + dx * 0.002) * dampingFactor;
+                particle.velocityY = (particle.velocityY + (Math.random() - 0.5) * randomSpread + dy * 0.002) * dampingFactor;
+                const maxVelocity = MULTIPLIED_VAPORIZE_SPREAD * 2;
+                const currentVelocity = Math.sqrt(particle.velocityX * particle.velocityX + particle.velocityY * particle.velocityY);
+                if (currentVelocity > maxVelocity) {
+                  const scale = maxVelocity / currentVelocity;
+                  particle.velocityX *= scale; particle.velocityY *= scale;
+                }
+                particle.x += particle.velocityX * deltaTime * 20;
+                particle.y += particle.velocityY * deltaTime * 10;
+                particle.opacity = Math.max(0, particle.opacity - deltaTime * (0.25 * (2000 / VAPORIZE_DURATION)));
+              }
+              if (particle.opacity > 0.01) allParticlesVaporized = false;
+            } else { allParticlesVaporized = false; }
+          });
+          return allParticlesVaporized;
+        };
+
+        const renderParticles = (ctx, particles, globalDpr) => {
+          ctx.save(); ctx.scale(globalDpr, globalDpr);
+          particles.forEach(particle => {
+            if (particle.opacity > 0) {
+              const color = particle.color.replace(/[\d.]+\)$/, `${particle.opacity})`);
+              ctx.fillStyle = color; ctx.fillRect(particle.x / globalDpr, particle.y / globalDpr, 1, 1);
+            }
+          });
+          ctx.restore();
+        };
+
+        const resetParticles = (particles) => {
+          particles.forEach(particle => {
+            particle.x = particle.originalX; particle.y = particle.originalY;
+            particle.opacity = particle.originalAlpha; particle.speed = 0;
+            particle.velocityX = 0; particle.velocityY = 0;
+          });
+        };
+
+        const renderCanvas = ({ framerProps, canvasRef, wrapperSize, particlesRef, globalDpr, currentTextIndex, transformedDensity }) => {
+          const canvas = canvasRef.current;
+          if (!canvas || !wrapperSize.width || !wrapperSize.height) return;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) return;
+          const { width, height } = wrapperSize;
+          canvas.style.width = `${width}px`; canvas.style.height = `${height}px`;
+          canvas.width = Math.floor(width * globalDpr); canvas.height = Math.floor(height * globalDpr);
+          const fontSize = parseInt(framerProps.font?.fontSize?.replace("px", "") || "50");
+          const font = `${framerProps.font?.fontWeight ?? 400} ${fontSize * globalDpr}px ${framerProps.font?.fontFamily ?? "sans-serif"}`;
+          const color = parseColor(framerProps.color ?? "rgb(153, 153, 153)");
+          const currentText = framerProps.texts[currentTextIndex] || "Next.js";
+          let textX = framerProps.alignment === "center" ? canvas.width / 2 : framerProps.alignment === "left" ? 0 : canvas.width;
+          let textY = framerProps.verticalAlignment === "top" ? 0 : framerProps.verticalAlignment === "bottom" ? canvas.height : canvas.height / 2;
+          const { particles, textBoundaries } = createParticles(ctx, canvas, currentText, textX, textY, font, color, framerProps.alignment || "left", framerProps.verticalAlignment || "center", framerProps.lineHeight || 1.2, fontSize * globalDpr);
+          particlesRef.current = particles; canvas.textBoundaries = textBoundaries;
+        };
+
+        const VaporizeTextCycle = ({ texts = ["Next.js", "React"], font = { fontFamily: "sans-serif", fontSize: "50px", fontWeight: 400 }, color = "rgb(255, 255, 255)", spread = 5, density = 5, animation = { vaporizeDuration: 2, fadeInDuration: 1, waitDuration: 0.5 }, direction = "left-to-right", alignment = "center", verticalAlignment = "center", tag = Tag.P, onComplete, onReady, singleCycle = false, lineHeight = 1.2 }) => {
+          const canvasRef = useRef(null);
+          const wrapperRef = useRef(null);
+          const isInView = useIsInView(wrapperRef);
+          const lastFontRef = useRef(null);
+          const particlesRef = useRef([]);
+          const [currentTextIndex, setCurrentTextIndex] = useState(0);
+          const [animationState, setAnimationState] = useState(singleCycle ? "vaporizing" : "static");
+          const vaporizeProgressRef = useRef(0);
+          const fadeOpacityRef = useRef(0);
+          const [wrapperSize, setWrapperSize] = useState({ width: 0, height: 0 });
+          const transformedDensity = transformValue(density, [0, 10], [0.3, 1], true);
+
+          useLayoutEffect(() => {
+            if (wrapperRef.current) {
+              const rect = wrapperRef.current.getBoundingClientRect();
+              if (rect.width > 0 && rect.height > 0) setWrapperSize({ width: rect.width, height: rect.height });
+            }
+          }, []);
+
+          const globalDpr = useMemo(() => typeof window !== "undefined" ? window.devicePixelRatio * 1.5 || 1 : 1, []);
+          const animationDurations = useMemo(() => ({ VAPORIZE_DURATION: (animation.vaporizeDuration ?? 2) * 1000, FADE_IN_DURATION: (animation.fadeInDuration ?? 1) * 1000, WAIT_DURATION: (animation.waitDuration ?? 0.5) * 1000 }), [animation.vaporizeDuration, animation.fadeInDuration, animation.waitDuration]);
+          const fontConfig = useMemo(() => {
+            const fontSize = parseInt(font.fontSize?.replace("px", "") || "50");
+            const VAPORIZE_SPREAD = calculateVaporizeSpread(fontSize);
+            return { fontSize, VAPORIZE_SPREAD, MULTIPLIED_VAPORIZE_SPREAD: VAPORIZE_SPREAD * spread, font: `${font.fontWeight ?? 400} ${fontSize * globalDpr}px ${font.fontFamily}` };
+          }, [font.fontSize, font.fontWeight, font.fontFamily, spread, globalDpr]);
+
+          useEffect(() => {
+            if (isInView) setAnimationState("vaporizing");
+            else setAnimationState("static");
+          }, [isInView, singleCycle]);
+
+          useEffect(() => {
+            if (!isInView) return;
+            let lastTime = performance.now();
+            let frameId;
+            const animate = (currentTime) => {
+              const deltaTime = (currentTime - lastTime) / 1000;
+              lastTime = currentTime;
+              const canvas = canvasRef.current;
+              const ctx = canvas?.getContext("2d");
+              if (!canvas || !ctx || !particlesRef.current.length) { frameId = requestAnimationFrame(animate); return; }
+              ctx.clearRect(0, 0, canvas.width, canvas.height);
+              switch (animationState) {
+                case "static": renderParticles(ctx, particlesRef.current, globalDpr); break;
+                case "vaporizing":
+                  vaporizeProgressRef.current += deltaTime * 100 / (animationDurations.VAPORIZE_DURATION / 1000);
+                  const textBoundaries = canvas.textBoundaries;
+                  if (!textBoundaries) break;
+                  const progress = Math.min(100, vaporizeProgressRef.current);
+                  const vaporizeX = direction === "left-to-right" ? textBoundaries.left + textBoundaries.width * progress / 100 : textBoundaries.right - textBoundaries.width * progress / 100;
+                  const allVaporized = updateParticles(particlesRef.current, vaporizeX, deltaTime, fontConfig.MULTIPLIED_VAPORIZE_SPREAD, animationDurations.VAPORIZE_DURATION, direction, transformedDensity);
+                  renderParticles(ctx, particlesRef.current, globalDpr);
+                  if (vaporizeProgressRef.current >= 100 && allVaporized) {
+                    if (singleCycle) { if (onComplete) onComplete(); return; }
+                    setCurrentTextIndex(prevIndex => (prevIndex + 1) % texts.length);
+                    setAnimationState("fadingIn"); fadeOpacityRef.current = 0;
+                  }
+                  break;
+                case "fadingIn":
+                  fadeOpacityRef.current += deltaTime * 1000 / animationDurations.FADE_IN_DURATION;
+                  ctx.save(); ctx.scale(globalDpr, globalDpr);
+                  particlesRef.current.forEach(particle => {
+                    particle.x = particle.originalX; particle.y = particle.originalY;
+                    const opacity = Math.min(fadeOpacityRef.current, 1) * particle.originalAlpha;
+                    ctx.fillStyle = particle.color.replace(/[\d.]+\)$/, `${opacity})`);
+                    ctx.fillRect(particle.x / globalDpr, particle.y / globalDpr, 1, 1);
+                  });
+                  ctx.restore();
+                  if (fadeOpacityRef.current >= 1) {
+                    setAnimationState("waiting");
+                    setTimeout(() => { setAnimationState("vaporizing"); vaporizeProgressRef.current = 0; resetParticles(particlesRef.current); }, animationDurations.WAIT_DURATION);
+                  }
+                  break;
+                case "waiting": renderParticles(ctx, particlesRef.current, globalDpr); break;
+              }
+              frameId = requestAnimationFrame(animate);
+            };
+            frameId = requestAnimationFrame(animate);
+            return () => cancelAnimationFrame(frameId);
+          }, [animationState, isInView, texts.length, direction, globalDpr, fontConfig.MULTIPLIED_VAPORIZE_SPREAD, animationDurations.FADE_IN_DURATION, animationDurations.WAIT_DURATION, animationDurations.VAPORIZE_DURATION, singleCycle, onComplete, transformedDensity]);
+
+          useLayoutEffect(() => {
+            if (wrapperSize.width > 0 && wrapperSize.height > 0) {
+              renderCanvas({ framerProps: { texts, font, color, alignment, verticalAlignment, lineHeight }, canvasRef, wrapperSize, particlesRef, globalDpr, currentTextIndex, transformedDensity });
+              if (onReady) onReady();
+            }
+          }, [texts, font, color, alignment, verticalAlignment, lineHeight, wrapperSize, currentTextIndex, globalDpr, transformedDensity]);
+
+          useEffect(() => {
+            const container = wrapperRef.current;
+            if (!container) return;
+            const resizeObserver = new ResizeObserver(entries => {
+              for (const entry of entries) setWrapperSize({ width: entry.contentRect.width, height: entry.contentRect.height });
+              renderCanvas({ framerProps: { texts, font, color, alignment, verticalAlignment, lineHeight }, canvasRef, wrapperSize: { width: container.clientWidth, height: container.clientHeight }, particlesRef, globalDpr, currentTextIndex, transformedDensity });
+            });
+            resizeObserver.observe(container);
+            return () => resizeObserver.disconnect();
+          }, [texts, font, color, alignment, verticalAlignment, lineHeight, globalDpr, currentTextIndex, transformedDensity]);
+
+          return createElement('div', { ref: wrapperRef, style: { width: "100%", height: "100%", pointerEvents: "none" } },
+            createElement('canvas', { ref: canvasRef, style: { minWidth: "30px", minHeight: "20px", pointerEvents: "none" } }),
+            createElement(Tag.P, { style: { position: "absolute", width: "0", height: "0", overflow: "hidden", userSelect: "none", pointerEvents: "none" } }, texts?.join(" ") ?? "")
+          );
+        };
+        // --- App Component ---
+        const FONTS = [
+          { name: '现代无衬线', value: "'Inter', sans-serif" },
+          { name: '优雅衬线', value: "'Playfair Display', serif" },
+          { name: '极客等宽', value: "'JetBrains Mono', monospace" },
+          { name: '中式楷体', value: "'Ma Shan Zheng', cursive" },
+          { name: '中式宋体', value: "'Noto Serif SC', serif" },
+        ];
+
+        const RAIN_URL = './audio/rain.mp3';
+        const SNOW_URL = './audio/snow.mp3';
+        const audioEngine = new AudioEngine(RAIN_URL, SNOW_URL);
+
+        function throttle(func, limit) {
+          let inThrottle;
+          return function(...args) {
+            if (!inThrottle) {
+              func.apply(this, args);
+              inThrottle = true;
+              setTimeout(() => inThrottle = false, limit);
+            }
+          };
+        }
+
+        const ControlSlider = memo(({ label, value, onChange, min = 0, max = 1, step = 0.01, icon }) => {
+          return createElement('div', { className: "space-y-4" },
+            createElement('div', { className: "flex items-center justify-between" },
+              createElement('div', { className: "flex items-center gap-2" },
+                icon && createElement('span', { className: "text-white/40" }, icon),
+                createElement('label', { className: "text-[10px] uppercase font-bold tracking-wider text-white/40" }, label)
+              ),
+              createElement('span', { className: "text-[10px] font-mono text-white/40" }, typeof value === 'number' ? value.toFixed(2) : value)
+            ),
+            createElement('input', {
+              type: "range",
+              min: min,
+              max: max,
+              step: step,
+              value: value,
+              onChange: (e) => onChange(parseFloat(e.target.value)),
+              className: "w-full h-1 bg-white/10 rounded-full appearance-none cursor-pointer accent-white hover:bg-white/20 transition-all"
+            })
+          );
+        });
+
+        const MemoizedRainShader = memo(RainShader);
+
+        function App() {
+          const loadSettings = () => {
+            try {
+              const saved = localStorage.getItem('rain-app-settings');
+              if (saved) return JSON.parse(saved);
+            } catch (e) { console.error("Failed to load settings:", e); }
+            return {};
+          };
+
+          const initialSettings = loadSettings();
+          const [raininess, setRaininess] = useState(initialSettings.raininess ?? 0.5);
+          const [fog, setFog] = useState(initialSettings.fog ?? 0.3);
+          const [refraction, setRefraction] = useState(initialSettings.refraction ?? 0.5);
+          const [speed, setSpeed] = useState(initialSettings.speed ?? 0.5);
+          const [size, setSize] = useState(initialSettings.size ?? 1.0);
+          const [bgRotation, setBgRotation] = useState(initialSettings.bgRotation ?? 0);
+          const [bgScale, setBgScale] = useState(initialSettings.bgScale ?? 1.0);
+          const [bgContrast, setBgContrast] = useState(initialSettings.bgContrast ?? 1.0);
+          const [bgBrightness, setBgBrightness] = useState(initialSettings.bgBrightness ?? 1.0);
+          const [mode, setMode] = useState(initialSettings.mode ?? 'rain');
+          const [volume, setVolume] = useState(initialSettings.volume ?? 0.5);
+          const [isMuted, setIsMuted] = useState(initialSettings.isMuted ?? false);
+          const [bgmVolume, setBgmVolume] = useState(initialSettings.bgmVolume ?? 0.4);
+          const [isBgmEnabled, setIsBgmEnabled] = useState(initialSettings.isBgmEnabled ?? true);
+          const [bgmUrl, setBgmUrl] = useState(initialSettings.bgmUrl ?? './audio/rain.mp3');
+          const [isPlaying, setIsPlaying] = useState(false);
+          const [showAudioOverlay, setShowAudioOverlay] = useState(true);
+          const [hasInteracted, setHasInteracted] = useState(false);
+
+          const throttledSetRaininess = useCallback(throttle(setRaininess, 16), []);
+          const throttledSetFog = useCallback(throttle(setFog, 16), []);
+          const throttledSetRefraction = useCallback(throttle(setRefraction, 16), []);
+          const throttledSetSpeed = useCallback(throttle(setSpeed, 16), []);
+          const throttledSetSize = useCallback(throttle(setSize, 16), []);
+          const throttledSetBgRotation = useCallback(throttle(setBgRotation, 16), []);
+          const throttledSetBgScale = useCallback(throttle(setBgScale, 16), []);
+          const throttledSetBgContrast = useCallback(throttle(setBgContrast, 16), []);
+          const throttledSetBgBrightness = useCallback(throttle(setBgBrightness, 16), []);
+          const throttledSetVolume = useCallback(throttle(setVolume, 16), []);
+          const throttledSetBgmVolume = useCallback(throttle(setBgmVolume, 16), []);
+
+          const [bgType, setBgType] = useState(initialSettings.bgType ?? 'image');
+          const [bgUrl, setBgUrl] = useState(initialSettings.bgUrl ?? './images/bg-rain.jpg');
+          const [isFontDropdownOpen, setIsFontDropdownOpen] = useState(false);
+          const [isPanelOpen, setIsPanelOpen] = useState(false);
+          const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+
+          const [notes, setNotes] = useState(() => {
+            try {
+              const saved = localStorage.getItem('rain-app-notes');
+              if (saved) return JSON.parse(saved);
+            } catch (e) {}
+            return [{ 
+              id: '1', 
+              title: new Date().toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' }), 
+              content: '', 
+              date: new Date().toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' }),
+              mode: initialSettings.mode ?? 'rain',
+              bgUrl: initialSettings.bgUrl ?? './images/bg-rain.jpg',
+              bgType: initialSettings.bgType ?? 'image',
+              bgmUrl: initialSettings.bgmUrl ?? './audio/rain.mp3'
+            }];
+          });
+          const [currentIndex, setCurrentIndex] = useState(0);
+
+          const text = notes[currentIndex]?.content || '';
+          const setText = (newText) => { setNotes(prev => prev.map((note, i) => i === currentIndex ? { ...note, content: newText } : note)); };
+          const title = notes[currentIndex]?.title || '';
+          const setTitle = (newTitle) => { setNotes(prev => prev.map((note, i) => i === currentIndex ? { ...note, title: newTitle } : note)); };
+
+          const [fontSize, setFontSize] = useState(initialSettings.fontSize ?? 32);
+          const [fontWeight, setFontWeight] = useState(initialSettings.fontWeight ?? 400);
+          const [lineHeight, setLineHeight] = useState(initialSettings.lineHeight ?? 1.5);
+          const [fontFamily, setFontFamily] = useState(initialSettings.fontFamily ?? "'Inter', sans-serif");
+          const [inputBlur, setInputBlur] = useState(initialSettings.inputBlur ?? 24);
+          const [isDeleting, setIsDeleting] = useState(false);
+          const [isVaporizeReady, setIsVaporizeReady] = useState(false);
+          const [deletedText, setDeletedText] = useState('');
+
+          const fileInputRef = useRef(null);
+          const bgmFileInputRef = useRef(null);
+
+          useEffect(() => {
+            const settings = { raininess, fog, refraction, speed, size, bgRotation, bgScale, bgContrast, bgBrightness, mode, volume, isMuted, bgType, bgUrl, fontSize, fontWeight, lineHeight, fontFamily, inputBlur, bgmVolume, isBgmEnabled, bgmUrl };
+            localStorage.setItem('rain-app-settings', JSON.stringify(settings));
+          }, [raininess, fog, refraction, speed, size, bgRotation, bgScale, bgContrast, bgBrightness, mode, volume, isMuted, bgType, bgUrl, fontSize, fontWeight, lineHeight, fontFamily, inputBlur, bgmVolume, isBgmEnabled, bgmUrl]);
+
+          useEffect(() => { localStorage.setItem('rain-app-notes', JSON.stringify(notes)); }, [notes]);
+
+          useEffect(() => {
+            if (hasInteracted) {
+              audioEngine.init().then(() => {
+                audioEngine.setMode(mode); audioEngine.setVolume(volume); audioEngine.setMuted(isMuted);
+                audioEngine.setBgmVolume(bgmVolume); audioEngine.setBgmEnabled(isBgmEnabled);
+                if (bgmUrl) audioEngine.setBgmUrl(bgmUrl);
+                audioEngine.play().then(() => setIsPlaying(true));
+              });
+            }
+          }, [hasInteracted]);
+
+          useEffect(() => { if (hasInteracted) audioEngine.setMode(mode); }, [mode, hasInteracted]);
+          useEffect(() => { if (hasInteracted) { audioEngine.setVolume(volume); audioEngine.setMuted(isMuted); } }, [volume, isMuted, hasInteracted]);
+          useEffect(() => { if (hasInteracted) { audioEngine.setBgmVolume(bgmVolume); audioEngine.setBgmEnabled(isBgmEnabled); } }, [bgmVolume, isBgmEnabled, hasInteracted]);
+          useEffect(() => { if (hasInteracted && bgmUrl) audioEngine.setBgmUrl(bgmUrl); }, [bgmUrl, hasInteracted]);
+
+          useEffect(() => {
+            const interval = setInterval(() => { if (hasInteracted) setIsPlaying(audioEngine.getIsPlaying()); }, 1000);
+            return () => clearInterval(interval);
+          }, [hasInteracted]);
+
+          const handleFileUpload = (e) => {
+            const file = e.target.files?.[0];
+            if (file) {
+              const url = URL.createObjectURL(file);
+              setBgUrl(url);
+              if (file.type.startsWith('video/')) setBgType('video');
+              else setBgType('image');
+            }
+          };
+
+          const handleBgmUpload = (e) => {
+            const file = e.target.files?.[0];
+            if (file && file.type.startsWith('audio/')) {
+              const url = URL.createObjectURL(file);
+              setBgmUrl(url); setIsBgmEnabled(true);
+            }
+          };
+
+          const handleModeChange = (newMode) => {
+            setMode(newMode);
+            if (newMode === 'rain') { setBgUrl('./images/bg-rain.jpg'); setBgmUrl('./audio/rain.mp3'); }
+            else { setBgUrl('./images/bg-snow.jpg'); setBgmUrl('./audio/snow.mp3'); }
+          };
+
+          const handleSave = async () => {
+            if (!text && !title) return;
+            if (navigator.share) {
+              try { await navigator.share({ title: title || '新备忘录', text: text }); return; }
+              catch (error) { console.log('Web Share failed, trying URL schemes...', error); }
+            }
+            const combinedContent = title ? `${title}\n${text}` : text;
+            const encodedText = encodeURIComponent(combinedContent);
+            const mobileNotesUrl = `mobilenotes://create?text=${encodedText}`;
+            const notesUrl = `notes://x-apple-data-detectors://note/create?body=${encodedText}`;
+            window.location.href = mobileNotesUrl;
+            setTimeout(() => { window.location.href = notesUrl; }, 300);
+          };
+
+          const handleDelete = () => {
+            if (!text || isDeleting) return;
+            setDeletedText(text); setIsDeleting(true); setIsVaporizeReady(false);
+          };
+
+          const onVaporizeComplete = () => { setIsDeleting(false); setIsVaporizeReady(false); setText(''); };
+
+          const handleAddNote = () => {
+            const newNote = { 
+              id: Math.random().toString(36).substr(2, 9), 
+              title: new Date().toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' }), 
+              content: '', 
+              date: new Date().toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' }),
+              mode, bgUrl, bgType, bgmUrl,
+              raininess, fog, refraction, speed, size, fontSize, fontWeight, lineHeight, fontFamily, inputBlur
+            };
+            setNotes(prev => [...prev, newNote]); setCurrentIndex(notes.length);
+          };
+
+          const handlePrevNote = () => { if (currentIndex > 0) setCurrentIndex(currentIndex - 1); };
+          const handleNextNote = () => { if (currentIndex < notes.length - 1) setCurrentIndex(currentIndex + 1); };
+
+          const handleStartAudio = async () => { setHasInteracted(true); setShowAudioOverlay(false); setIsMuted(false); await audioEngine.init(); await audioEngine.play(); setIsPlaying(true); };
+
+          return createElement('div', { className: "relative w-full h-screen overflow-hidden font-sans text-white selection:bg-white/30" },
+            createElement(AnimatePresence, null,
+              showAudioOverlay && !hasInteracted && createElement(motion.div, {
+                key: "audio-overlay",
+                initial: { opacity: 0 },
+                animate: { opacity: 1 },
+                exit: { opacity: 0 },
+                className: "fixed inset-0 z-[100] flex items-center justify-center bg-black/70 backdrop-blur-2xl cursor-pointer pointer-events-auto",
+                onClick: handleStartAudio
+              },
+                createElement('div', { className: "relative bg-white/10 backdrop-blur-3xl border border-white/20 p-12 rounded-[48px] text-center space-y-8 shadow-2xl scale-110 max-w-sm w-full mx-4 pointer-events-auto" },
+                  createElement('button', {
+                    onClick: (e) => { e.stopPropagation(); setShowAudioOverlay(false); setHasInteracted(true); },
+                    className: "absolute top-6 right-6 p-2 rounded-full bg-white/5 hover:bg-white/10 text-white/40 hover:text-white transition-colors z-[110]"
+                  }, createElement(X, { size: 20 })),
+                  createElement('div', { className: "relative mx-auto w-24 h-24 flex items-center justify-center bg-white/5 rounded-full border border-white/10" },
+                    createElement(Volume2, { size: 48, className: "text-white/80 animate-pulse" })
+                  ),
+                  createElement('div', { className: "space-y-4" },
+                    createElement('h2', { className: "text-2xl font-bold tracking-[0.3em] uppercase text-white" }, "开启雨声"),
+                    createElement('p', { className: "text-sm text-white/60 leading-relaxed" }, "由于浏览器策略限制", createElement('br'), "请点击屏幕以激活环境音效")
+                  ),
+                  createElement('div', { className: "pt-4" },
+                    createElement('button', {
+                      onClick: (e) => { e.stopPropagation(); handleStartAudio(); },
+                      className: "inline-block px-8 py-4 rounded-full bg-white text-black font-bold text-sm tracking-widest uppercase hover:scale-105 transition-transform shadow-xl"
+                    }, "立即开启")
+                  )
+                )
+              )
+            ),
+            createElement(MemoizedRainShader, {
+              raininess, fog, refraction, speed, size, bgRotation, bgScale, bgContrast, bgBrightness,
+              backgroundType: bgType, backgroundUrl: bgUrl, mode
+            }),
+            createElement('main', { className: "flex flex-col items-center justify-center w-full h-full p-4 overflow-hidden" },
+              createElement('div', { className: "flex items-center justify-center gap-6 w-full max-w-6xl" },
+                createElement(motion.div, { drag: true, dragMomentum: false, className: "relative w-full max-w-2xl cursor-default" },
+                  createElement('div', {
+                    className: cn("relative group w-full h-[70vh] bg-white/10 border border-white/20 rounded-[32px] shadow-[0_8px_32px_0_rgba(31,38,135,0.37)] transition-all duration-500 ease-out hover:bg-white/15 hover:border-white/30 will-change-transform transform-gpu overflow-hidden flex flex-col"),
+                    style: { backdropFilter: `blur(${inputBlur}px)`, WebkitBackdropFilter: `blur(${inputBlur}px)` }
+                  },
+                    createElement('div', { className: "flex justify-center pt-1 pb-1 opacity-0 group-hover:opacity-100 transition-opacity duration-300 cursor-grab active:cursor-grabbing" },
+                      createElement(GripHorizontal, { size: 14, className: "text-white/20" })
+                    ),
+                    createElement('div', { className: "relative px-12 py-1 flex-1 flex flex-col overflow-hidden" },
+                      createElement('div', { className: "flex flex-col items-center mb-4 space-y-1" },
+                        createElement('input', {
+                          value: title,
+                          onChange: (e) => setTitle(e.target.value),
+                          className: "bg-transparent border-none outline-none text-center text-3xl tracking-wider text-white/90 w-full",
+                          style: { fontFamily: fontFamily, fontWeight: fontWeight },
+                          placeholder: "标题"
+                        })
+                      ),
+                      createElement('div', { className: "relative flex-1" },
+                        createElement('textarea', {
+                          value: text,
+                          onChange: (e) => setText(e.target.value),
+                          placeholder: "在此输入您的感悟...",
+                          style: { fontSize: `${fontSize}px`, fontWeight: fontWeight, fontFamily: fontFamily, lineHeight: lineHeight, padding: 0, margin: 0 },
+                          className: cn("w-full h-full bg-transparent border-none outline-none resize-none p-0 m-0 text-white/80 placeholder:text-white/20 transition-opacity duration-150 custom-scrollbar", isVaporizeReady && "opacity-0 pointer-events-none")
+                        }),
+                        isDeleting && createElement('div', { className: "absolute inset-0 pointer-events-none" },
+                          createElement(VaporizeTextCycle, {
+                            texts: [deletedText],
+                            font: { fontFamily: fontFamily, fontSize: `${fontSize}px`, fontWeight: fontWeight },
+                            lineHeight: lineHeight,
+                            color: "rgba(255, 255, 255, 0.9)",
+                            spread: 6, density: 7,
+                            animation: { vaporizeDuration: 2.5, fadeInDuration: 0.5, waitDuration: 0 },
+                            direction: "left-to-right", alignment: "left", verticalAlignment: "top",
+                            singleCycle: true, onReady: () => setIsVaporizeReady(true), onComplete: onVaporizeComplete
+                          })
+                        )
+                      )
+                    ),
+                    createElement('div', { className: "px-12 py-4 flex items-center justify-between border-t border-white/5" },
+                      createElement('div', { className: "flex items-center gap-6" },
+                        createElement('button', { onClick: () => setIsMuted(!isMuted), className: "text-white/30 hover:text-white/60 transition-colors" }, isMuted ? createElement(VolumeX, { size: 18 }) : createElement(Volume2, { size: 18 })),
+                        createElement('div', { className: "flex items-center gap-2 ml-2" },
+                          createElement('button', { onClick: () => handleModeChange('rain'), className: cn("p-2 rounded-md transition-all", mode === 'rain' ? "text-white bg-white/10" : "text-white/20 hover:text-white/40"), title: "雨天模式" }, createElement(CloudRain, { size: 18 })),
+                          createElement('button', { onClick: () => handleModeChange('snow'), className: cn("p-2 rounded-md transition-all", mode === 'snow' ? "text-white bg-white/10" : "text-white/20 hover:text-white/40"), title: "雪天模式" }, createElement(CloudSnow, { size: 18 }))
+                        )
+                      ),
+                      createElement('div', { className: "flex items-center gap-6" },
+                        createElement('button', { onClick: handleSave, disabled: isDeleting, className: "text-white/30 hover:text-white/60 transition-colors disabled:opacity-10", title: "保存到备忘录 (iOS)" }, createElement(Save, { size: 18 })),
+                        createElement('button', { onClick: handleDelete, className: "text-white/30 hover:text-white/60 transition-colors", title: "清空内容" }, createElement(Trash2, { size: 18 })),
+                        createElement('button', { onClick: () => { setIsHistoryOpen(!isHistoryOpen); setIsPanelOpen(false); }, className: "text-white/30 hover:text-white/60 transition-colors", title: "历史记录" }, createElement(History, { size: 18 })),
+                        createElement('button', { onClick: handleAddNote, className: "text-white/30 hover:text-white/60 transition-colors" }, createElement(Plus, { size: 18 })),
+                        createElement('button', { onClick: handlePrevNote, disabled: currentIndex === 0, className: "text-white/30 hover:text-white/60 transition-colors disabled:opacity-10" }, createElement(ChevronLeft, { size: 18 })),
+                        createElement('button', { onClick: handleNextNote, disabled: currentIndex === notes.length - 1, className: "text-white/30 hover:text-white/60 transition-colors disabled:opacity-10" }, createElement(ChevronRight, { size: 18 }))
+                      )
+                    ),
+                    createElement('div', { className: "absolute inset-0 pointer-events-none rounded-[32px] overflow-hidden" },
+                      createElement('div', { className: "absolute top-0 left-0 w-full h-1/2 bg-gradient-to-b from-white/10 to-transparent" }),
+                      createElement('div', { className: "absolute -top-[100%] -left-[100%] w-[300%] h-[300%] bg-[radial-gradient(circle_at_center,rgba(255,255,255,0.05)_0%,transparent_50%)] animate-pulse" })
+                    )
+                  )
+                ),
+                createElement(AnimatePresence, null,
+                  isHistoryOpen && createElement(motion.div, {
+                    initial: { opacity: 0, x: 20 },
+                    animate: { opacity: 1, x: 0 },
+                    exit: { opacity: 0, x: 20 },
+                    className: "hidden lg:flex flex-col w-80 self-stretch bg-black/40 backdrop-blur-3xl border border-white/10 rounded-[32px] p-6 shadow-2xl will-change-transform transform-gpu"
+                  },
+                    createElement('div', { className: "flex items-center justify-between mb-6 shrink-0" },
+                      createElement('h3', { className: "text-sm font-bold uppercase tracking-widest text-white/60" }, "历史记录"),
+                      createElement('button', { onClick: () => setIsHistoryOpen(false), className: "text-white/40 hover:text-white" }, createElement(X, { size: 18 }))
+                    ),
+                    createElement('div', { className: "overflow-y-auto pr-2 custom-scrollbar flex-1 space-y-3" },
+                      notes.map((note, index) => createElement('div', {
+                        key: note.id,
+                        className: cn(
+                          "group flex flex-col p-4 rounded-2xl transition-all cursor-pointer border",
+                          index === currentIndex ? "bg-white/10 border-white/20" : "bg-white/5 border-transparent hover:bg-white/10 hover:border-white/10"
+                        ),
+                        onClick: () => { 
+                          setCurrentIndex(index); 
+                          if (note.mode) {
+                            setMode(note.mode);
+                            setBgUrl(note.bgUrl);
+                            setBgType(note.bgType);
+                            setBgmUrl(note.bgmUrl);
+                            if (note.raininess !== undefined) setRaininess(note.raininess);
+                            if (note.fog !== undefined) setFog(note.fog);
+                            if (note.refraction !== undefined) setRefraction(note.refraction);
+                            if (note.speed !== undefined) setSpeed(note.speed);
+                            if (note.size !== undefined) setSize(note.size);
+                            if (note.fontSize !== undefined) setFontSize(note.fontSize);
+                            if (note.fontWeight !== undefined) setFontWeight(note.fontWeight);
+                            if (note.lineHeight !== undefined) setLineHeight(note.lineHeight);
+                            if (note.fontFamily !== undefined) setFontFamily(note.fontFamily);
+                            if (note.inputBlur !== undefined) setInputBlur(note.inputBlur);
+                          }
+                          setIsHistoryOpen(false); 
+                        }
+                      },
+                        createElement('div', { className: "flex items-center justify-between mb-1" },
+                          createElement('span', { className: "text-sm font-bold text-white/90 truncate" }, note.title || "无标题"),
+                          createElement('div', { className: "flex items-center gap-1.5" },
+                            note.mode === 'rain' ? createElement(CloudRain, { size: 12, className: "text-blue-400/60" }) : createElement(CloudSnow, { size: 12, className: "text-indigo-200/60" }),
+                            notes.length > 1 && createElement('button', {
+                              onClick: (e) => {
+                                e.stopPropagation();
+                                const newNotes = notes.filter((_, i) => i !== index);
+                                setNotes(newNotes);
+                                if (currentIndex >= index && currentIndex > 0) {
+                                  setCurrentIndex(prev => prev - 1);
+                                }
+                              },
+                              className: "p-1 text-white/20 hover:text-red-400/60 transition-all"
+                            }, createElement(Trash2, { size: 12 }))
+                          )
+                        ),
+                        createElement('p', { className: "text-xs text-white/40 line-clamp-2 mb-2 italic" }, note.content || "暂无内容..."),
+                        createElement('div', { className: "flex items-center gap-2 text-[10px] text-white/20" },
+                          createElement(Clock, { size: 10 }),
+                          createElement('span', null, note.date)
+                        )
+                      ))
+                    )
+                  )
+                )
+              )
+            ),
+            createElement('div', { className: "fixed bottom-8 right-8 z-50" },
+              createElement(AnimatePresence, null,
+                isPanelOpen && createElement(motion.div, {
+                  initial: { opacity: 0, scale: 0.9, y: 20 },
+                  animate: { opacity: 1, scale: 1, y: 0 },
+                  exit: { opacity: 0, scale: 0.9, y: 20 },
+                  className: "absolute bottom-20 right-0 w-80 h-[70vh] bg-black/40 backdrop-blur-3xl border border-white/10 rounded-3xl p-6 shadow-2xl flex flex-col will-change-transform transform-gpu"
+                },
+                  createElement('div', { className: "flex items-center justify-between mb-6 shrink-0" },
+                    createElement('h3', { className: "text-sm font-bold uppercase tracking-widest text-white/60" }, "设置"),
+                    createElement('button', { onClick: () => setIsPanelOpen(false), className: "text-white/40 hover:text-white" }, createElement(X, { size: 18 }))
+                  ),
+                  createElement('div', { className: "space-y-10 overflow-y-auto pr-2 custom-scrollbar flex-1" },
+                    createElement('div', { className: "pb-8 border-b border-white/10 space-y-8" },
+                      createElement('div', { className: "space-y-[16px]" },
+                        createElement('label', { className: "text-[10px] uppercase font-bold tracking-wider text-white/40" }, "背景设置"),
+                        createElement('div', { className: "flex gap-2" },
+                          createElement('button', {
+                            onClick: () => fileInputRef.current?.click(),
+                            className: "flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-2xl bg-white/10 border border-white/20 text-white hover:bg-white/15 transition-all text-sm backdrop-blur-xl"
+                          }, createElement(Upload, { size: 16 }), createElement('span', null, "上传背景")),
+                          createElement('input', { type: "file", ref: fileInputRef, onChange: handleFileUpload, accept: "image/*", className: "hidden" })
+                        )
+                      )
+                    ),
+                    createElement('div', { className: "pb-8 border-b border-white/10 space-y-8" },
+                      createElement('div', { className: "space-y-[16px] relative" },
+                        createElement('label', { className: "text-[10px] uppercase font-bold tracking-wider text-white/40" }, "字体选择"),
+                        createElement('div', { className: "relative" },
+                          createElement('button', {
+                            onClick: () => setIsFontDropdownOpen(!isFontDropdownOpen),
+                            className: cn("w-full flex items-center justify-between px-4 py-3 rounded-2xl text-sm transition-all border bg-white/10 border-white/20 text-white hover:bg-white/15 backdrop-blur-xl", isFontDropdownOpen && "rounded-b-none border-b-transparent")
+                          },
+                            createElement('span', { style: { fontFamily: fontFamily } }, FONTS.find(f => f.value === fontFamily)?.name || '选择字体'),
+                            createElement(ChevronDown, { size: 16, className: cn("transition-transform duration-300", isFontDropdownOpen && "rotate-180") })
+                          ),
+                          createElement(AnimatePresence, null,
+                            isFontDropdownOpen && createElement(motion.div, {
+                              initial: { opacity: 0, y: -10 }, animate: { opacity: 1, y: 0 }, exit: { opacity: 0, y: -10 },
+                              className: cn("absolute top-full left-0 w-full z-50 overflow-hidden bg-white/10 backdrop-blur-[100px] border-x border-b border-white/20 rounded-b-2xl shadow-2xl")
+                            },
+                              createElement('div', { className: "max-h-60 overflow-y-auto custom-scrollbar" },
+                                FONTS.map((f) => createElement('button', {
+                                  key: f.value,
+                                  onClick: () => { setFontFamily(f.value); setIsFontDropdownOpen(false); },
+                                  className: cn("w-full text-left px-4 py-3 text-sm transition-all hover:bg-white/10", fontFamily === f.value ? "text-white bg-white/5" : "text-white/60"),
+                                  style: { fontFamily: f.value }
+                                }, f.name))
+                              )
+                            )
+                          )
+                        )
+                      ),
+                      createElement(ControlSlider, { label: "字体大小", value: fontSize, onChange: setFontSize, min: 12, max: 72 }),
+                      createElement(ControlSlider, { label: "字体粗细", value: fontWeight, onChange: setFontWeight, min: 100, max: 900 }),
+                      createElement(ControlSlider, { label: "行间距", value: lineHeight, onChange: setLineHeight, min: 0.8, max: 3.0, step: 0.1 })
+                    ),
+                    createElement('div', { className: "pb-8 border-b border-white/10 space-y-8" },
+                      createElement('div', { className: "flex items-center justify-between" },
+                        createElement('div', { className: "flex flex-col gap-1" },
+                          createElement('label', { className: "text-[10px] uppercase font-bold tracking-wider text-white/40" }, "雨声设置"),
+                          createElement('span', { className: "text-[8px] text-white/20 uppercase tracking-tighter" }, isPlaying ? "正在播放" : "已暂停 / 等待交互")
+                        ),
+                        createElement('div', { className: "flex gap-2" },
+                          createElement('button', { onClick: () => { setHasInteracted(true); setIsMuted(false); audioEngine.play().then(() => setIsPlaying(true)); }, className: "text-[10px] px-2 py-1 rounded-md bg-white/10 hover:bg-white/20 text-white/60 hover:text-white transition-all" }, "手动播放"),
+                          createElement('button', { onClick: () => { setHasInteracted(true); setIsMuted(false); audioEngine.init().then(() => { audioEngine.play().then(() => setIsPlaying(true)); }); }, className: "text-[10px] px-2 py-1 rounded-md bg-white/10 hover:bg-white/20 text-white/60 hover:text-white transition-all" }, "重置音频")
+                        )
+                      ),
+                      createElement(ControlSlider, { label: "音量", value: volume, onChange: throttledSetVolume, min: 0, max: 1, step: 0.01, icon: isMuted ? createElement(VolumeX, { size: 14 }) : createElement(Volume2, { size: 14 }) })
+                    ),
+                    createElement('div', { className: "pb-8 border-b border-white/10 space-y-8" },
+                      createElement('div', { className: "flex items-center justify-between" },
+                        createElement('div', { className: "flex flex-col gap-1" },
+                          createElement('label', { className: "text-[10px] uppercase font-bold tracking-wider text-white/40" }, "背景音乐"),
+                          createElement('span', { className: "text-[8px] text-white/20 uppercase tracking-tighter" }, isBgmEnabled ? "已启用" : "已禁用")
+                        ),
+                        createElement('div', { className: "flex gap-2" },
+                          createElement('input', { type: "file", ref: bgmFileInputRef, onChange: handleBgmUpload, accept: "audio/*", className: "hidden" }),
+                          createElement('button', { onClick: () => bgmFileInputRef.current?.click(), className: "text-[10px] px-2 py-1 rounded-md bg-white/10 hover:bg-white/20 text-white/60 hover:text-white transition-all flex items-center gap-1" }, createElement(Upload, { size: 10 }), " 上传音乐"),
+                          createElement('button', { onClick: () => setIsBgmEnabled(!isBgmEnabled), className: cn("text-[10px] px-2 py-1 rounded-md transition-all", isBgmEnabled ? "bg-white/20 text-white" : "bg-white/5 text-white/40 hover:text-white/60") }, isBgmEnabled ? "禁用" : "启用")
+                        )
+                      ),
+                      createElement(ControlSlider, { label: "音乐音量", value: bgmVolume, onChange: throttledSetBgmVolume, min: 0, max: 1, step: 0.01, icon: createElement(Music, { size: 14 }) })
+                    ),
+                    createElement(ControlSlider, { label: mode === 'rain' ? "雨量" : "雪量", value: raininess, onChange: throttledSetRaininess }),
+                    createElement(ControlSlider, { label: "雾气", value: fog, onChange: throttledSetFog }),
+                    createElement(ControlSlider, { label: "折射率", value: refraction, onChange: throttledSetRefraction }),
+                    createElement(ControlSlider, { label: "速度", value: speed, onChange: throttledSetSpeed }),
+                    createElement(ControlSlider, { label: mode === 'rain' ? "雨滴大小" : "雪花大小", value: size, onChange: throttledSetSize, min: 0.1, max: 3.0 }),
+                    createElement(ControlSlider, { label: "背景旋转", value: bgRotation, onChange: throttledSetBgRotation, min: 0, max: 360 }),
+                    createElement(ControlSlider, { label: "背景缩放", value: bgScale, onChange: throttledSetBgScale, min: 0.5, max: 3.0 }),
+                    createElement(ControlSlider, { label: "背景对比度", value: bgContrast, onChange: throttledSetBgContrast, min: 0, max: 2.0 }),
+                    createElement(ControlSlider, { label: "背景亮度", value: bgBrightness, onChange: throttledSetBgBrightness, min: 0, max: 2.0 }),
+                    createElement(ControlSlider, { label: "输入框模糊", value: inputBlur, onChange: setInputBlur, min: 0, max: 64 }),
+                    createElement('div', { className: "pt-4 border-t border-white/10" },
+                      bgType !== 'fluid' && createElement('button', { onClick: () => { setBgType('fluid'); setBgUrl(undefined); }, className: "w-full mt-2 text-xs text-white/40 hover:text-white transition-colors" }, "重置为流体")
+                    )
+                  )
+                ),
+                createElement(motion.button, {
+                  whileHover: { scale: 1.1 }, whileTap: { scale: 0.9 }, onClick: () => { setIsPanelOpen(!isPanelOpen); setIsHistoryOpen(false); },
+                  className: cn("w-14 h-14 rounded-full flex items-center justify-center transition-all duration-300 shadow-2xl border bg-white/10 backdrop-blur-2xl text-white border-white/20 hover:bg-white/20")
+                }, isPanelOpen ? createElement(Minimize2, { size: 24 }) : createElement(Sliders, { size: 24 }))
+              )
+            );
+          }
+
+        // --- Main Entry Point ---
+        const root = createRoot(document.getElementById('root'));
+        root.render(createElement(App));
+
+    </script>
+</body>
+</html>
